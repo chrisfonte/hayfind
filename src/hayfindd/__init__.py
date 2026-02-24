@@ -1,0 +1,1 @@
+"""hayfind daemon package."""

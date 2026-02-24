@@ -1,0 +1,11 @@
+repos:
+  - path: ~/projects/repo-a
+    include:
+      - "**/*.py"
+      - "**/*.md"
+    exclude:
+      - ".git/**"
+      - "**/.git/**"
+      - "**/node_modules/**"
+      - "**/.venv/**"
+      - "**/__pycache__/**"

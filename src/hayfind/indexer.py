@@ -22,6 +22,12 @@ class IndexStats:
     skipped_files: int = 0
     removed_files: int = 0
     chunk_count: int = 0
+    total_files: int = 0
+    processed_files: int = 0
+    next_offset: int | None = None
+    done: bool = True
+    error_count: int = 0
+    error_files: list[str] | None = None
 
 
 def is_binary(path: Path) -> bool:
@@ -87,6 +93,12 @@ def iter_files(repo: RepoConfig):
             yield path, rel
 
 
+def collect_repo_files(repo: RepoConfig) -> list[tuple[Path, Path]]:
+    files = list(iter_files(repo))
+    files.sort(key=lambda item: item[1].as_posix())
+    return files
+
+
 def _load_state() -> dict:
     if STATE_PATH.exists():
         try:
@@ -121,16 +133,33 @@ def index_repo(
     include: list[str],
     exclude: list[str],
     force: bool = False,
+    batch_offset: int = 0,
+    batch_files: int | None = None,
 ) -> IndexStats:
     repo_cfg = RepoConfig(path=repo_path.resolve(), include=include, exclude=exclude)
     repo_name = repo_cfg.path.name
-    stats = IndexStats(repo=repo_name)
+    stats = IndexStats(repo=repo_name, error_files=[])
 
     collection = get_collection()
     embedder = get_embedder(for_indexing=True)
-    active_file_ids: set[str] = set()
+    all_files = collect_repo_files(repo_cfg)
+    stats.total_files = len(all_files)
 
-    for path, rel in iter_files(repo_cfg):
+    start = max(0, batch_offset)
+    if batch_files is None:
+        end = stats.total_files
+    else:
+        end = min(stats.total_files, start + batch_files)
+    selected_files = all_files[start:end]
+    stats.processed_files = end
+    stats.done = end >= stats.total_files
+    stats.next_offset = None if stats.done else end
+
+    active_file_ids: set[str] = {
+        f"{repo_name}:{rel.as_posix()}" for _, rel in all_files
+    }
+
+    for path, rel in selected_files:
         if is_binary(path):
             stats.skipped_files += 1
             continue
@@ -139,6 +168,9 @@ def index_repo(
             raw = path.read_bytes()
         except OSError:
             stats.skipped_files += 1
+            stats.error_count += 1
+            if stats.error_files is not None and len(stats.error_files) < 10:
+                stats.error_files.append(rel.as_posix())
             continue
 
         digest = sha256_bytes(raw)
@@ -166,7 +198,13 @@ def index_repo(
             stats.skipped_files += 1
             continue
 
-        embeddings = embedder.embed_documents(chunks)
+        try:
+            embeddings = embedder.embed_documents(chunks)
+        except Exception:
+            stats.error_count += 1
+            if stats.error_files is not None and len(stats.error_files) < 10:
+                stats.error_files.append(rel.as_posix())
+            continue
         ids: list[str] = []
         metadatas: list[dict] = []
         documents: list[str] = []
@@ -192,19 +230,39 @@ def index_repo(
         stats.indexed_files += 1
         stats.chunk_count += len(chunks)
 
-    # Chroma always returns ids; include only controls additional fields.
-    existing_repo = collection.get(where=safe_where(repo=repo_name), include=["metadatas"])
-    if existing_repo and existing_repo.get("ids"):
+    if stats.done:
+        # Chroma always returns ids; include only controls additional fields.
+        # Batch retrieval of existing repo documents to avoid "too many SQL variables" errors.
+        limit = 5000
+        offset = 0
         stale_ids: list[str] = []
         removed_file_ids: set[str] = set()
-        for idx, doc_id in enumerate(existing_repo["ids"]):
-            meta = existing_repo.get("metadatas", [])[idx]
-            if meta and meta.get("file_id") not in active_file_ids:
-                stale_ids.append(doc_id)
-                removed_file_ids.add(meta.get("file_id", ""))
+
+        while True:
+            existing_repo = collection.get(
+                where=safe_where(repo=repo_name),
+                include=["metadatas"],
+                limit=limit,
+                offset=offset,
+            )
+            if not existing_repo or not existing_repo.get("ids"):
+                break
+
+            for idx, doc_id in enumerate(existing_repo["ids"]):
+                meta = existing_repo.get("metadatas", [])[idx]
+                if meta and meta.get("file_id") not in active_file_ids:
+                    stale_ids.append(doc_id)
+                    removed_file_ids.add(meta.get("file_id", ""))
+
+            if len(existing_repo["ids"]) < limit:
+                break
+            offset += limit
+
         if stale_ids:
-            collection.delete(ids=stale_ids)
+            # Batch deletion to avoid similar SQL variable limits.
+            for i in range(0, len(stale_ids), limit):
+                collection.delete(ids=stale_ids[i : i + limit])
             stats.removed_files = len([x for x in removed_file_ids if x])
 
-    update_last_indexed(repo_name)
+        update_last_indexed(repo_name)
     return stats

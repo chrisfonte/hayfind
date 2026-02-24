@@ -60,10 +60,25 @@ class GeminiEmbedder:
         raise RuntimeError("Unexpected embedding response format from Gemini API")
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        """Embed a list of document chunks.
+
+        Note: the Gemini API batch embeddings endpoint limits batches to 100
+        items per request. We chunk requests to stay under that cap.
+        """
         if not texts:
             return []
-        response = self._client.models.embed_content(model=MODEL_NAME, contents=texts)
-        return self._extract_embeddings(response)
+
+        all_vectors: list[list[float]] = []
+        batch_size = 100
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+            response = self._client.models.embed_content(
+                model=MODEL_NAME,
+                contents=batch,
+            )
+            all_vectors.extend(self._extract_embeddings(response))
+
+        return all_vectors
 
     def embed_query(self, query: str) -> list[float]:
         response = self._client.models.embed_content(model=MODEL_NAME, contents=query)

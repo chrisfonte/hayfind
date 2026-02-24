@@ -7,6 +7,8 @@ import time
 from collections.abc import Callable
 from typing import Any, TypeVar
 
+import httpx
+
 try:
     from google import genai
     from google.genai.errors import ClientError
@@ -27,6 +29,10 @@ logger = logging.getLogger(__name__)
 
 MODEL_NAME = os.getenv("HAYFIND_GEMINI_EMBED_MODEL", "gemini-embedding-001")
 OPENAI_MODEL_NAME = os.getenv("HAYFIND_OPENAI_EMBED_MODEL", "text-embedding-3-small")
+LOCAL_EMBED_URL = os.getenv(
+    "HAYFIND_LOCAL_EMBED_URL", "http://127.0.0.1:11434/api/embeddings"
+)
+LOCAL_MODEL_NAME = os.getenv("HAYFIND_LOCAL_EMBED_MODEL", "nomic-embed-text")
 
 # Gemini batch embeddings endpoint: max 100 items per request.
 DEFAULT_BATCH_SIZE = 50
@@ -255,6 +261,51 @@ class OpenAIEmbedder:
         return vectors[0]
 
 
+class LocalEmbedder:
+    def __init__(
+        self,
+        *,
+        client: Any | None = None,
+        url: str | None = None,
+        model: str | None = None,
+    ) -> None:
+        self._client = client or httpx.Client(timeout=30.0)
+        self._url = url or LOCAL_EMBED_URL
+        self._model = model or LOCAL_MODEL_NAME
+
+    def _extract_embedding(self, payload: Any) -> list[float]:
+        if not isinstance(payload, dict):
+            raise RuntimeError("Unexpected embedding response format from local provider")
+        embedding = payload.get("embedding")
+        if not isinstance(embedding, list):
+            raise RuntimeError("Unexpected embedding vector format from local provider")
+        return [float(v) for v in embedding]
+
+    def _embed_one(self, text: str) -> list[float]:
+        response = self._client.post(
+            self._url,
+            json={"model": self._model, "prompt": text},
+        )
+        response.raise_for_status()
+        return self._extract_embedding(response.json())
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        batch_size = _env_int("HAYFIND_EMBED_BATCH_SIZE", DEFAULT_BATCH_SIZE)
+        sleep_s = _env_float("HAYFIND_EMBED_SLEEP_S", DEFAULT_SLEEP_S)
+        all_vectors: list[list[float]] = []
+        for i in range(0, len(texts), batch_size):
+            for text in texts[i : i + batch_size]:
+                all_vectors.append(self._embed_one(text))
+            if sleep_s:
+                time.sleep(sleep_s)
+        return all_vectors
+
+    def embed_query(self, query: str) -> list[float]:
+        return self._embed_one(query)
+
+
 class FallbackEmbedder:
     def __init__(
         self,
@@ -343,7 +394,7 @@ def _build_provider(provider: str) -> Any:
     if provider == "openai":
         return OpenAIEmbedder()
     if provider == "local":
-        raise RuntimeError("HAYFIND_EMBED_PROVIDER=local is not implemented yet")
+        return LocalEmbedder()
     raise RuntimeError(f"Unsupported embedding provider: {provider}")
 
 

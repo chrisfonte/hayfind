@@ -4,10 +4,13 @@ import pytest
 
 from hayfind import embeddings
 from hayfind.embeddings import (
+    LOCAL_EMBED_URL,
+    LOCAL_MODEL_NAME,
     MODEL_NAME,
     OPENAI_MODEL_NAME,
     FallbackEmbedder,
     GeminiEmbedder,
+    LocalEmbedder,
     OpenAIEmbedder,
     get_embedder,
 )
@@ -74,6 +77,42 @@ def test_openai_embedder_normalizes_response_to_plain_vectors() -> None:
     assert query == [7.0, 8.0, 9.0]
 
 
+class _FakeLocalResponse:
+    def __init__(self, payload: dict) -> None:
+        self._payload = payload
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict:
+        return self._payload
+
+
+class _FakeLocalClient:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+
+    def post(self, url: str, *, json: dict) -> _FakeLocalResponse:
+        self.calls.append((url, json))
+        prompt = json["prompt"]
+        if prompt == "find me":
+            return _FakeLocalResponse({"embedding": [7, 8, 9]})
+        return _FakeLocalResponse({"embedding": [1, 2, 3]})
+
+
+def test_local_embedder_normalizes_response_to_plain_vectors() -> None:
+    client = _FakeLocalClient()
+    embedder = LocalEmbedder(client=client)
+
+    docs = embedder.embed_documents(["doc one", "doc two"])
+    query = embedder.embed_query("find me")
+
+    assert docs == [[1.0, 2.0, 3.0], [1.0, 2.0, 3.0]]
+    assert query == [7.0, 8.0, 9.0]
+    assert client.calls[0][0] == LOCAL_EMBED_URL
+    assert client.calls[0][1]["model"] == LOCAL_MODEL_NAME
+
+
 def test_get_embedder_selects_provider_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HAYFIND_EMBED_PROVIDER", "openai")
     monkeypatch.delenv("HAYFIND_EMBED_FALLBACK_PROVIDER", raising=False)
@@ -87,12 +126,17 @@ def test_get_embedder_selects_provider_from_env(monkeypatch: pytest.MonkeyPatch)
     assert isinstance(embedder, _Chosen)
 
 
-def test_get_embedder_rejects_local_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_get_embedder_selects_local_provider_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HAYFIND_EMBED_PROVIDER", "local")
     monkeypatch.delenv("HAYFIND_EMBED_FALLBACK_PROVIDER", raising=False)
 
-    with pytest.raises(RuntimeError, match="not implemented"):
-        get_embedder()
+    class _Chosen:
+        pass
+
+    monkeypatch.setattr(embeddings, "LocalEmbedder", lambda: _Chosen())
+    embedder = get_embedder()
+
+    assert isinstance(embedder, _Chosen)
 
 
 def test_get_embedder_builds_fallback_for_indexing(monkeypatch: pytest.MonkeyPatch) -> None:

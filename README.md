@@ -16,7 +16,7 @@ This repository includes the original build prompt in [`prompts/`](prompts/).
 - ChromaDB-backed vector index (`documents` collection)
   - Persistent local storage by default
   - Optional remote Chroma server via `CHROMA_HOST` + `CHROMA_PORT`
-- Pluggable embeddings providers (`gemini` or `openai`) with optional fallback
+- Pluggable embeddings providers (`gemini`, `openai`, or local Ollama) with optional fallback
 - Incremental indexing by file hash (`sha256`)
 - Binary-file skipping (MIME + null-byte checks)
 - Search filters: `--repo`, `--path-prefix`
@@ -65,6 +65,18 @@ OpenAI:
 - `HAYFIND_OPENAI_EMBED_MODEL` (default: `text-embedding-3-small`)
 - `OPENAI_API_KEY` (required for `openai` provider or fallback)
 
+Local Ollama:
+
+- `HAYFIND_LOCAL_EMBED_URL` (default: `http://127.0.0.1:11434/api/embeddings`)
+- `HAYFIND_LOCAL_EMBED_MODEL` (default: `nomic-embed-text`)
+
+Quick setup:
+
+```bash
+ollama serve
+ollama pull nomic-embed-text
+```
+
 Migration note:
 
 - A ChatGPT subscription does not include API access by itself. You need an OpenAI API key (`OPENAI_API_KEY`) from the OpenAI API platform.
@@ -93,6 +105,16 @@ hayfind search "foo" --path-prefix src/ --json
 hayfind status
 hayfind reindex
 hayfind install-hooks
+```
+
+Local-only embedding example:
+
+```bash
+export HAYFIND_EMBED_PROVIDER=local
+export HAYFIND_LOCAL_EMBED_URL=http://127.0.0.1:11434/api/embeddings
+export HAYFIND_LOCAL_EMBED_MODEL=nomic-embed-text
+hayfind index ~/projects/some-repo
+hayfind search "foo" --repo some-repo
 ```
 
 ## HTTP API

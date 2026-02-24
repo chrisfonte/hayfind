@@ -23,6 +23,16 @@ class ServiceClient:
                 response = client.post(path, json=payload)
                 response.raise_for_status()
                 return response.json()
+        except httpx.HTTPStatusError as exc:
+            # Surface server-side errors (e.g. embedding quota) rather than
+            # always claiming the service isn't running.
+            body = exc.response.text.strip()
+            msg = (
+                f"Service error ({path}) against {self.base_url} (HTTP {exc.response.status_code})."
+            )
+            if body:
+                msg += f"\n{body}"
+            raise typer.BadParameter(msg) from exc
         except httpx.HTTPError as exc:
             msg = (
                 f"Service request failed ({path}) against {self.base_url}. "

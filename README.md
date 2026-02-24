@@ -16,8 +16,7 @@ This repository includes the original build prompt in [`prompts/`](prompts/).
 - ChromaDB-backed vector index (`documents` collection)
   - Persistent local storage by default
   - Optional remote Chroma server via `CHROMA_HOST` + `CHROMA_PORT`
-- Gemini embeddings (`text-embedding-004`)
-  - Note: upstream `google-generativeai` is deprecated; migrate to `google-genai` when convenient.
+- Gemini embeddings (`gemini-embedding-001`) via `google-genai`
 - Incremental indexing by file hash (`sha256`)
 - Binary-file skipping (MIME + null-byte checks)
 - Search filters: `--repo`, `--path-prefix`

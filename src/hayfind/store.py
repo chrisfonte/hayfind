@@ -13,13 +13,40 @@ from hayfind.config import data_dir
 COLLECTION_NAME = "documents"
 
 
-def chroma_client() -> chromadb.ClientAPI:
-    """Return a Chroma client.
+def _patch_chroma_telemetry() -> None:
+    """Patch Chroma telemetry batching bug (KeyError in Posthog.capture).
 
-    We explicitly disable anonymized telemetry by default because some Chroma
-    versions have been observed to throw internal KeyErrors in telemetry batching
-    under concurrent use.
+    Some Chroma versions can raise KeyError when deleting a batch_key under
+    concurrent access. This patch makes the deletion idempotent.
+
+    This is a pragmatic MVP fix; upstream should fix the race.
     """
+
+    try:
+        from chromadb.telemetry.product.posthog import Posthog
+    except Exception:
+        return
+
+    if getattr(Posthog.capture, "__hayfind_patched__", False):
+        return
+
+    original = Posthog.capture
+
+    def capture(self, event):  # type: ignore[no-untyped-def]
+        try:
+            return original(self, event)
+        except KeyError:
+            # Ignore telemetry batching race.
+            return None
+
+    capture.__hayfind_patched__ = True  # type: ignore[attr-defined]
+    Posthog.capture = capture  # type: ignore[assignment]
+
+
+def chroma_client() -> chromadb.ClientAPI:
+    """Return a Chroma client."""
+
+    _patch_chroma_telemetry()
 
     settings = Settings(anonymized_telemetry=False)
 

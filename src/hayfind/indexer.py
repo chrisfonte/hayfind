@@ -192,7 +192,8 @@ def index_repo(
         stats.indexed_files += 1
         stats.chunk_count += len(chunks)
 
-    existing_repo = collection.get(where=safe_where(repo=repo_name), include=["metadatas", "ids"])
+    # Chroma always returns ids; include only controls additional fields.
+    existing_repo = collection.get(where=safe_where(repo=repo_name), include=["metadatas"])
     if existing_repo and existing_repo.get("ids"):
         stale_ids: list[str] = []
         removed_file_ids: set[str] = set()

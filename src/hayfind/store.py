@@ -13,6 +13,29 @@ from hayfind.config import data_dir
 COLLECTION_NAME = "documents"
 
 
+def _sanitize(value: str) -> str:
+    keep = []
+    for ch in value.lower():
+        if ch.isalnum() or ch in {"-", "_"}:
+            keep.append(ch)
+        elif ch in {"/", ":", ".", " "}:
+            keep.append("-")
+    cleaned = "".join(keep).strip("-")
+    return cleaned or "default"
+
+
+def _default_chroma_path() -> Path:
+    provider = (os.getenv("HAYFIND_EMBED_PROVIDER") or "gemini").strip().lower()
+    model_by_provider = {
+        "gemini": os.getenv("HAYFIND_GEMINI_EMBED_MODEL", "gemini-embedding-001"),
+        "openai": os.getenv("HAYFIND_OPENAI_EMBED_MODEL", "text-embedding-3-small"),
+        "local": os.getenv("HAYFIND_LOCAL_EMBED_MODEL", "nomic-embed-text"),
+    }
+    model = model_by_provider.get(provider, "unknown")
+    suffix = f"{_sanitize(provider)}-{_sanitize(model)}"
+    return data_dir() / f"chroma-{suffix}"
+
+
 def _patch_chroma_telemetry() -> None:
     """Patch Chroma telemetry batching bug (KeyError in Posthog.capture).
 
@@ -55,7 +78,7 @@ def chroma_client() -> chromadb.ClientAPI:
     if host and port:
         return chromadb.HttpClient(host=host, port=int(port), settings=settings)
 
-    persist_path = Path(os.getenv("HAYFIND_CHROMA_PATH", data_dir() / "chroma"))
+    persist_path = Path(os.getenv("HAYFIND_CHROMA_PATH", str(_default_chroma_path())))
     persist_path.mkdir(parents=True, exist_ok=True)
     return chromadb.PersistentClient(path=str(persist_path), settings=settings)
 

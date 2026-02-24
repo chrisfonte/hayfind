@@ -6,6 +6,7 @@ from typing import Any
 
 import chromadb
 from chromadb.api.models.Collection import Collection
+from chromadb.config import Settings
 
 from hayfind.config import data_dir
 
@@ -13,14 +14,23 @@ COLLECTION_NAME = "documents"
 
 
 def chroma_client() -> chromadb.ClientAPI:
+    """Return a Chroma client.
+
+    We explicitly disable anonymized telemetry by default because some Chroma
+    versions have been observed to throw internal KeyErrors in telemetry batching
+    under concurrent use.
+    """
+
+    settings = Settings(anonymized_telemetry=False)
+
     host = os.getenv("CHROMA_HOST")
     port = os.getenv("CHROMA_PORT")
     if host and port:
-        return chromadb.HttpClient(host=host, port=int(port))
+        return chromadb.HttpClient(host=host, port=int(port), settings=settings)
 
     persist_path = Path(os.getenv("HAYFIND_CHROMA_PATH", data_dir() / "chroma"))
     persist_path.mkdir(parents=True, exist_ok=True)
-    return chromadb.PersistentClient(path=str(persist_path))
+    return chromadb.PersistentClient(path=str(persist_path), settings=settings)
 
 
 def get_collection() -> Collection:

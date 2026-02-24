@@ -16,7 +16,7 @@ This repository includes the original build prompt in [`prompts/`](prompts/).
 - ChromaDB-backed vector index (`documents` collection)
   - Persistent local storage by default
   - Optional remote Chroma server via `CHROMA_HOST` + `CHROMA_PORT`
-- Gemini embeddings (`gemini-embedding-001`) via `google-genai`
+- Pluggable embeddings providers (`gemini` or `openai`) with optional fallback
 - Incremental indexing by file hash (`sha256`)
 - Binary-file skipping (MIME + null-byte checks)
 - Search filters: `--repo`, `--path-prefix`
@@ -45,13 +45,29 @@ hayfind init-config
 
 Example config is in [`examples/config.yaml`](examples/config.yaml).
 
-## Gemini API key lookup order
+## Embeddings provider and env vars
 
-`hayfind` checks for an API key in this order:
+Provider selection:
 
+- `HAYFIND_EMBED_PROVIDER=gemini|openai|local` (default: `gemini`)
+- `HAYFIND_EMBED_FALLBACK_PROVIDER=openai|gemini` (optional, indexing only)
+
+Gemini:
+
+- `HAYFIND_GEMINI_EMBED_MODEL` (default: `gemini-embedding-001`)
+- API key lookup order:
 1. `GEMINI_API_KEY`
 2. `GOOGLE_API_KEY`
 3. `~/.credentials/gemini/api_key`
+
+OpenAI:
+
+- `HAYFIND_OPENAI_EMBED_MODEL` (default: `text-embedding-3-small`)
+- `OPENAI_API_KEY` (required for `openai` provider or fallback)
+
+Migration note:
+
+- A ChatGPT subscription does not include API access by itself. You need an OpenAI API key (`OPENAI_API_KEY`) from the OpenAI API platform.
 
 Do not commit secrets.
 
@@ -68,6 +84,9 @@ Default service URL used by CLI: `http://127.0.0.1:8765`
 ## CLI usage
 
 ```bash
+export HAYFIND_EMBED_PROVIDER=gemini
+export HAYFIND_EMBED_FALLBACK_PROVIDER=openai
+export OPENAI_API_KEY=...
 hayfind index ~/projects/some-repo
 hayfind search "foo" --repo some-repo
 hayfind search "foo" --path-prefix src/ --json

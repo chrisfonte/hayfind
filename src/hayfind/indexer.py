@@ -9,7 +9,7 @@ from fnmatch import fnmatch
 from pathlib import Path
 
 from hayfind.config import RepoConfig, data_dir
-from hayfind.embeddings import GeminiEmbedder
+from hayfind.embeddings import get_embedder
 from hayfind.store import get_collection, safe_where
 
 STATE_PATH = data_dir() / "state.json"
@@ -127,7 +127,7 @@ def index_repo(
     stats = IndexStats(repo=repo_name)
 
     collection = get_collection()
-    embedder = GeminiEmbedder()
+    embedder = get_embedder(for_indexing=True)
     active_file_ids: set[str] = set()
 
     for path, rel in iter_files(repo_cfg):

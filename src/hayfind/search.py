@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from hayfind.embeddings import GeminiEmbedder
+from hayfind.embeddings import get_embedder
 from hayfind.indexer import get_index_state
 from hayfind.models import SearchHit, SearchResponse, StatusResponse
 from hayfind.store import COLLECTION_NAME, get_collection, safe_where
@@ -13,7 +13,7 @@ def search(
     path_prefix: str | None = None,
 ) -> SearchResponse:
     collection = get_collection()
-    embedder = GeminiEmbedder()
+    embedder = get_embedder()
     query_embedding = embedder.embed_query(query)
 
     where = safe_where(repo=repo)

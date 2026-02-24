@@ -20,3 +20,10 @@ def load_gemini_api_key() -> str:
         "Gemini API key not found. Set GEMINI_API_KEY/GOOGLE_API_KEY "
         "or create ~/.credentials/gemini/api_key"
     )
+
+
+def load_openai_api_key() -> str:
+    value = (os.getenv("OPENAI_API_KEY") or "").strip()
+    if value:
+        return value
+    raise RuntimeError("OpenAI API key not found. Set OPENAI_API_KEY")

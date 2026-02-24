@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
 import time
@@ -13,9 +14,19 @@ except ImportError:  # pragma: no cover - exercised only when dependency is miss
     genai = None
     ClientError = None  # type: ignore[assignment]
 
-from hayfind.credentials import load_gemini_api_key
+try:
+    from openai import APIStatusError, OpenAI, RateLimitError
+except ImportError:  # pragma: no cover - exercised only when dependency is missing.
+    OpenAI = None
+    APIStatusError = None  # type: ignore[assignment]
+    RateLimitError = None  # type: ignore[assignment]
+
+from hayfind.credentials import load_gemini_api_key, load_openai_api_key
+
+logger = logging.getLogger(__name__)
 
 MODEL_NAME = os.getenv("HAYFIND_GEMINI_EMBED_MODEL", "gemini-embedding-001")
+OPENAI_MODEL_NAME = os.getenv("HAYFIND_OPENAI_EMBED_MODEL", "text-embedding-3-small")
 
 # Gemini batch embeddings endpoint: max 100 items per request.
 DEFAULT_BATCH_SIZE = 50
@@ -55,6 +66,19 @@ def _parse_retry_delay_seconds(message: str) -> float | None:
     if m:
         return float(m.group(1))
     return None
+
+
+def _is_rate_or_quota_error(exc: Exception) -> bool:
+    if ClientError is not None and isinstance(exc, ClientError):
+        if getattr(exc, "status_code", None) == 429:
+            return True
+    if RateLimitError is not None and isinstance(exc, RateLimitError):
+        return True
+    if APIStatusError is not None and isinstance(exc, APIStatusError):
+        if getattr(exc, "status_code", None) == 429:
+            return True
+    message = str(exc).lower()
+    return "429" in message or "rate limit" in message or "quota" in message
 
 
 def _call_with_retry(fn: Callable[[], T], *, max_attempts: int = 5) -> T:
@@ -170,3 +194,172 @@ class GeminiEmbedder:
         if not vectors:
             raise RuntimeError("Empty embedding response from Gemini API")
         return vectors[0]
+
+
+class OpenAIEmbedder:
+    def __init__(self, client: Any | None = None) -> None:
+        if client is not None:
+            self._client = client
+            return
+        if OpenAI is None:
+            raise RuntimeError("Missing dependency: install `openai` to use OpenAI embeddings")
+        self._client = OpenAI(api_key=load_openai_api_key())
+
+    def _extract_embeddings(self, payload: Any) -> list[list[float]]:
+        if isinstance(payload, dict):
+            data = payload.get("data", [])
+        elif hasattr(payload, "data"):
+            data = payload.data
+        else:
+            raise RuntimeError("Unexpected embedding response format from OpenAI API")
+
+        vectors: list[list[float]] = []
+        for item in data:
+            if isinstance(item, dict):
+                embedding = item.get("embedding")
+            else:
+                embedding = getattr(item, "embedding", None)
+            if embedding is None:
+                raise RuntimeError("Unexpected embedding vector format from OpenAI API")
+            vectors.append([float(v) for v in embedding])
+        return vectors
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+
+        batch_size = _env_int("HAYFIND_EMBED_BATCH_SIZE", DEFAULT_BATCH_SIZE)
+        sleep_s = _env_float("HAYFIND_EMBED_SLEEP_S", DEFAULT_SLEEP_S)
+
+        all_vectors: list[list[float]] = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+
+            def _do() -> Any:
+                return self._client.embeddings.create(model=OPENAI_MODEL_NAME, input=batch)
+
+            response = _call_with_retry(_do)
+            all_vectors.extend(self._extract_embeddings(response))
+            if sleep_s:
+                time.sleep(sleep_s)
+
+        return all_vectors
+
+    def embed_query(self, query: str) -> list[float]:
+        response = _call_with_retry(
+            lambda: self._client.embeddings.create(model=OPENAI_MODEL_NAME, input=[query])
+        )
+        vectors = self._extract_embeddings(response)
+        if not vectors:
+            raise RuntimeError("Empty embedding response from OpenAI API")
+        return vectors[0]
+
+
+class FallbackEmbedder:
+    def __init__(
+        self,
+        *,
+        primary: Any,
+        primary_provider: str,
+        fallback: Any,
+        fallback_provider: str,
+    ) -> None:
+        self._primary = primary
+        self._primary_provider = primary_provider
+        self._fallback = fallback
+        self._fallback_provider = fallback_provider
+        self._switched = False
+
+    def _switch(self, *, error: Exception) -> None:
+        if self._switched:
+            return
+        self._switched = True
+        logger.warning(
+            "Embedding provider switch: %s -> %s after rate/quota failure: %s",
+            self._primary_provider,
+            self._fallback_provider,
+            error,
+        )
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+
+        batch_size = min(_env_int("HAYFIND_EMBED_BATCH_SIZE", DEFAULT_BATCH_SIZE), 100)
+        all_vectors: list[list[float]] = []
+
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+            if self._switched:
+                all_vectors.extend(self._fallback.embed_documents(batch))
+                continue
+            try:
+                all_vectors.extend(self._primary.embed_documents(batch))
+            except Exception as exc:  # noqa: BLE001
+                if not _is_rate_or_quota_error(exc):
+                    raise
+                self._switch(error=exc)
+                all_vectors.extend(self._fallback.embed_documents(batch))
+
+        return all_vectors
+
+    def embed_query(self, query: str) -> list[float]:
+        if self._switched:
+            return self._fallback.embed_query(query)
+        try:
+            return self._primary.embed_query(query)
+        except Exception as exc:  # noqa: BLE001
+            if not _is_rate_or_quota_error(exc):
+                raise
+            self._switch(error=exc)
+            return self._fallback.embed_query(query)
+
+
+def _normalize_provider(name: str | None) -> str:
+    provider = (name or "gemini").strip().lower()
+    if provider not in {"gemini", "openai", "local"}:
+        raise RuntimeError(
+            "Unsupported HAYFIND_EMBED_PROVIDER. Use one of: gemini, openai, local"
+        )
+    return provider
+
+
+def _normalize_fallback_provider(name: str | None) -> str | None:
+    if name is None:
+        return None
+    provider = name.strip().lower()
+    if not provider:
+        return None
+    if provider not in {"gemini", "openai"}:
+        raise RuntimeError(
+            "Unsupported HAYFIND_EMBED_FALLBACK_PROVIDER. Use one of: gemini, openai"
+        )
+    return provider
+
+
+def _build_provider(provider: str) -> Any:
+    if provider == "gemini":
+        return GeminiEmbedder()
+    if provider == "openai":
+        return OpenAIEmbedder()
+    if provider == "local":
+        raise RuntimeError("HAYFIND_EMBED_PROVIDER=local is not implemented yet")
+    raise RuntimeError(f"Unsupported embedding provider: {provider}")
+
+
+def get_embedder(*, for_indexing: bool = False) -> Any:
+    provider = _normalize_provider(os.getenv("HAYFIND_EMBED_PROVIDER"))
+    fallback_provider = _normalize_fallback_provider(
+        os.getenv("HAYFIND_EMBED_FALLBACK_PROVIDER")
+    )
+
+    primary = _build_provider(provider)
+    if not for_indexing or not fallback_provider or fallback_provider == provider:
+        return primary
+    fallback = _build_provider(fallback_provider)
+    return FallbackEmbedder(
+        primary=primary,
+        primary_provider=provider,
+        fallback=fallback,
+        fallback_provider=fallback_provider,
+    )

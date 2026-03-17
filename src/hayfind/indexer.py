@@ -110,7 +110,9 @@ def _load_state() -> dict:
 
 def _save_state(state: dict) -> None:
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    tmp = STATE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    tmp.replace(STATE_PATH)  # atomic rename — prevents corruption on crash mid-write
 
 
 def update_last_indexed(repo: str) -> None:
@@ -126,6 +128,34 @@ def get_last_indexed() -> str | None:
 
 def get_index_state() -> dict:
     return _load_state()
+
+
+def write_checkpoint(repo: str, offset: int, total_files: int, force: bool) -> None:
+    """Persist in-progress batch offset after each successful batch.
+
+    Allows CLI to resume from this offset on restart rather than starting from 0.
+    """
+    state = _load_state()
+    state.setdefault("checkpoints", {})[repo] = {
+        "started_at": datetime.now(UTC).isoformat(),
+        "offset": offset,
+        "total_files": total_files,
+        "force": force,
+        "done": False,
+    }
+    _save_state(state)
+
+
+def clear_checkpoint(repo: str) -> None:
+    """Remove checkpoint on successful run completion (done=True)."""
+    state = _load_state()
+    state.get("checkpoints", {}).pop(repo, None)
+    _save_state(state)
+
+
+def get_checkpoint(repo: str) -> dict | None:
+    """Return in-progress checkpoint for repo, or None if absent."""
+    return _load_state().get("checkpoints", {}).get(repo)
 
 
 def index_repo(
@@ -155,9 +185,7 @@ def index_repo(
     stats.done = end >= stats.total_files
     stats.next_offset = None if stats.done else end
 
-    active_file_ids: set[str] = {
-        f"{repo_name}:{rel.as_posix()}" for _, rel in all_files
-    }
+    active_file_ids: set[str] = {f"{repo_name}:{rel.as_posix()}" for _, rel in all_files}
 
     for path, rel in selected_files:
         if is_binary(path):
@@ -230,6 +258,11 @@ def index_repo(
         stats.indexed_files += 1
         stats.chunk_count += len(chunks)
 
+    # Write checkpoint after each batch so CLI can resume on restart.
+    # Only checkpoint in batched mode (batch_files is not None) — single-shot runs don't need it.
+    if batch_files is not None and not stats.done:
+        write_checkpoint(repo_name, end, stats.total_files, force)
+
     if stats.done:
         # Chroma always returns ids; include only controls additional fields.
         # Batch retrieval of existing repo documents to avoid "too many SQL variables" errors.
@@ -265,4 +298,5 @@ def index_repo(
             stats.removed_files = len([x for x in removed_file_ids if x])
 
         update_last_indexed(repo_name)
+        clear_checkpoint(repo_name)  # clean completion — remove in-progress marker
     return stats

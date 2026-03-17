@@ -58,6 +58,106 @@ def _print_json(data: dict) -> None:
     typer.echo(json.dumps(data, indent=2))
 
 
+def _index_repo_in_batches(
+    client: ServiceClient,
+    repo_path: Path,
+    *,
+    force: bool,
+    batch_files: int,
+    show_progress: bool,
+    safe_mode: bool = False,
+    force_restart: bool = False,
+) -> dict:
+    if safe_mode:
+        os.environ["HAYFIND_EMBED_BATCH_SIZE"] = "10"
+        os.environ["HAYFIND_EMBED_SLEEP_S"] = "2.0"
+        batch_files = min(batch_files, 50)
+        if show_progress:
+            typer.echo("Safe mode: embed_batch_size=10, sleep=2.0s, cli_batch=50")
+
+    # Check for an in-progress checkpoint and resume unless --force-restart
+    start_offset = 0
+    if not force_restart:
+        try:
+            status_data = client.get("/status")
+            checkpoints = status_data.get("checkpoints", {})
+            cp = checkpoints.get(repo_path.name)
+            if cp and not cp.get("done", True):
+                start_offset = int(cp.get("offset", 0))
+                force = cp.get("force", force)
+                if show_progress:
+                    typer.echo(
+                        f"Resuming {repo_path.name} from offset "
+                        f"{start_offset}/{cp.get('total_files', '?')}"
+                    )
+        except Exception:  # noqa: BLE001
+            pass  # service may not be running yet; proceed from 0
+
+    payload = {
+        "path": str(repo_path.expanduser().resolve()),
+        "force": force,
+        "batch_offset": start_offset,
+        "batch_files": batch_files,
+    }
+    aggregate = {
+        "repo": repo_path.name,
+        "indexed_files": 0,
+        "skipped_files": 0,
+        "removed_files": 0,
+        "chunk_count": 0,
+        "total_files": 0,
+        "processed_files": 0,
+        "done": False,
+        "error_count": 0,
+        "error_files": [],
+    }
+    batch_number = 0
+    while True:
+        result = client.post("/index", payload)
+        batch_number += 1
+
+        aggregate["repo"] = result.get("repo", aggregate["repo"])
+        aggregate["indexed_files"] += int(result.get("indexed_files", 0))
+        aggregate["skipped_files"] += int(result.get("skipped_files", 0))
+        aggregate["chunk_count"] += int(result.get("chunk_count", 0))
+        aggregate["error_count"] += int(result.get("error_count", 0))
+        aggregate["total_files"] = int(result.get("total_files") or aggregate["total_files"])
+        aggregate["processed_files"] = int(
+            result.get("processed_files") or aggregate["processed_files"]
+        )
+        for path in result.get("error_files", []):
+            if path not in aggregate["error_files"] and len(aggregate["error_files"]) < 10:
+                aggregate["error_files"].append(path)
+
+        if show_progress:
+            typer.echo(
+                (
+                    "Batch {batch}: {repo} processed {processed}/{total} files "
+                    "(indexed={indexed}, skipped={skipped}, chunks={chunks}, errors={errors})"
+                ).format(
+                    batch=batch_number,
+                    repo=aggregate["repo"],
+                    processed=aggregate["processed_files"],
+                    total=aggregate["total_files"],
+                    indexed=result.get("indexed_files", 0),
+                    skipped=result.get("skipped_files", 0),
+                    chunks=result.get("chunk_count", 0),
+                    errors=result.get("error_count", 0),
+                )
+            )
+
+        if result.get("done", True):
+            aggregate["done"] = True
+            aggregate["removed_files"] = int(result.get("removed_files", 0))
+            break
+
+        next_offset = result.get("next_offset")
+        if next_offset is None:
+            raise typer.BadParameter("Indexing response missing next_offset while done=false")
+        payload["batch_offset"] = int(next_offset)
+    return aggregate
+
+
 def _load_or_init_config() -> AppConfig:
     ensure_config_path(DEFAULT_CONFIG_PATH)
     return load_config(DEFAULT_CONFIG_PATH)
@@ -77,10 +177,38 @@ def init_config() -> None:
 
 
 @app.command()
-def index(path: str, force: bool = False, as_json: bool = typer.Option(False, "--json")) -> None:
+def index(
+    path: str,
+    force: bool = False,
+    batch_files: int = typer.Option(
+        int(os.getenv("HAYFIND_INDEX_BATCH_FILES", "200")),
+        "--batch-files",
+        min=1,
+        help="Number of files to process per /index request.",
+    ),
+    safe_mode: bool = typer.Option(
+        False,
+        "--safe-mode",
+        help="Ultra-conservative rate limits (batch_size=10, sleep=2.0s).",
+    ),
+    force_restart: bool = typer.Option(
+        False,
+        "--force-restart",
+        help="Ignore existing checkpoint and start from offset 0.",
+    ),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
     """Index one repository path via service."""
-    payload = {"path": str(Path(path).expanduser().resolve()), "force": force}
-    result = ServiceClient().post("/index", payload)
+    client = ServiceClient()
+    result = _index_repo_in_batches(
+        client,
+        Path(path),
+        force=force,
+        batch_files=batch_files,
+        show_progress=not as_json,
+        safe_mode=safe_mode,
+        force_restart=force_restart,
+    )
     if as_json:
         _print_json(result)
         return
@@ -133,10 +261,29 @@ def status(as_json: bool = typer.Option(False, "--json")) -> None:
     typer.echo(f"Documents: {result['doc_count']}")
     typer.echo(f"Repos: {', '.join(result['repos']) if result['repos'] else '(none)'}")
     typer.echo(f"Last indexed: {result.get('last_indexed_at') or '(never)'}")
+    checkpoints = result.get("checkpoints", {})
+    if checkpoints:
+        typer.echo("In-progress checkpoints:")
+        for repo, cp in checkpoints.items():
+            typer.echo(
+                f"  {repo}: offset={cp['offset']}/{cp['total_files']} (started {cp['started_at']})"
+            )
 
 
 @app.command()
-def reindex(as_json: bool = typer.Option(False, "--json")) -> None:
+def reindex(
+    safe_mode: bool = typer.Option(
+        False,
+        "--safe-mode",
+        help="Ultra-conservative rate limits (batch_size=10, sleep=2.0s).",
+    ),
+    force_restart: bool = typer.Option(
+        False,
+        "--force-restart",
+        help="Ignore existing checkpoint and start from offset 0.",
+    ),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
     """Force reindex for all repos configured in config.yaml."""
     config = _load_or_init_config()
     if not config.repos:
@@ -147,8 +294,17 @@ def reindex(as_json: bool = typer.Option(False, "--json")) -> None:
     client = ServiceClient()
     results: list[dict] = []
     for repo in config.repos:
-        payload = {"path": str(repo.path), "force": True}
-        results.append(client.post("/index", payload))
+        results.append(
+            _index_repo_in_batches(
+                client,
+                repo.path,
+                force=True,
+                batch_files=int(os.getenv("HAYFIND_INDEX_BATCH_FILES", "200")),
+                show_progress=not as_json,
+                safe_mode=safe_mode,
+                force_restart=force_restart,
+            )
+        )
 
     if as_json:
         _print_json({"results": results})

@@ -22,6 +22,7 @@ This repository includes the original build prompt in [`prompts/`](prompts/).
 - Search filters: `--repo`, `--path-prefix`
 - JSON output mode for search/status/index/reindex
 - Git hook installer (`post-merge`) for configured repos
+- Batched indexing over `/index` for large repositories (progress per batch)
 
 ## Install
 
@@ -36,6 +37,8 @@ pipx install .
 Default config path:
 
 - `~/.config/hayfind/config.yaml`
+- Data dir (state + local Chroma path base): `~/.local/share/hayfind`
+- Override data dir with `HAYFIND_DATA_DIR=/absolute/path`
 
 Generate a starter config:
 
@@ -100,6 +103,7 @@ export HAYFIND_EMBED_PROVIDER=gemini
 export HAYFIND_EMBED_FALLBACK_PROVIDER=openai
 export OPENAI_API_KEY=...
 hayfind index ~/projects/some-repo
+hayfind index ~/projects/some-repo --batch-files 200
 hayfind search "foo" --repo some-repo
 hayfind search "foo" --path-prefix src/ --json
 hayfind status
@@ -126,9 +130,16 @@ Request:
 ```json
 {
   "path": "/absolute/path/to/repo",
-  "force": false
+  "force": false,
+  "batch_offset": 0,
+  "batch_files": 200
 }
 ```
+
+`batch_offset` and `batch_files` are optional. CLI defaults to batched calls for reliability on large repos. Override default batch size with:
+
+- `--batch-files <N>`
+- `HAYFIND_INDEX_BATCH_FILES` (default `200`)
 
 ### `POST /search`
 

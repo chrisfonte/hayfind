@@ -42,6 +42,10 @@ def index_endpoint(req: IndexRequest) -> IndexResponse:
             status_code=400,
             detail=f"Path not found or not a directory: {repo_path}",
         )
+    if req.batch_offset < 0:
+        raise HTTPException(status_code=400, detail="batch_offset must be >= 0")
+    if req.batch_files is not None and req.batch_files <= 0:
+        raise HTTPException(status_code=400, detail="batch_files must be > 0")
 
     cfg = load_config(DEFAULT_CONFIG_PATH)
     repo_cfg = next((r for r in cfg.repos if r.path == repo_path), None)
@@ -51,11 +55,24 @@ def index_endpoint(req: IndexRequest) -> IndexResponse:
         if repo_cfg
         else [".git/**", "**/.git/**", "**/node_modules/**", "**/.venv/**", "**/__pycache__/**"]
     )
-    stats = index_repo(repo_path, include=include, exclude=exclude, force=req.force)
+    stats = index_repo(
+        repo_path,
+        include=include,
+        exclude=exclude,
+        force=req.force,
+        batch_offset=req.batch_offset,
+        batch_files=req.batch_files,
+    )
     return IndexResponse(
         repo=stats.repo,
         indexed_files=stats.indexed_files,
         skipped_files=stats.skipped_files,
         removed_files=stats.removed_files,
         chunk_count=stats.chunk_count,
+        total_files=stats.total_files,
+        processed_files=stats.processed_files,
+        next_offset=stats.next_offset,
+        done=stats.done,
+        error_count=stats.error_count,
+        error_files=stats.error_files,
     )

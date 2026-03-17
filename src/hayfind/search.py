@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from hayfind.embeddings import get_embedder
 from hayfind.indexer import get_index_state
-from hayfind.models import SearchHit, SearchResponse, StatusResponse
+from hayfind.models import RepoCheckpoint, SearchHit, SearchResponse, StatusResponse
 from hayfind.store import COLLECTION_NAME, get_collection, safe_where
 
 
@@ -54,9 +54,21 @@ def status() -> StatusResponse:
     doc_count = collection.count()
     state = get_index_state()
     repos = sorted(state.get("repos", {}).keys())
+    raw_checkpoints = state.get("checkpoints", {})
+    checkpoints = {
+        repo: RepoCheckpoint(
+            offset=cp["offset"],
+            total_files=cp["total_files"],
+            started_at=cp["started_at"],
+            done=cp.get("done", False),
+        )
+        for repo, cp in raw_checkpoints.items()
+        if isinstance(cp, dict)
+    }
     return StatusResponse(
         collection=COLLECTION_NAME,
         doc_count=doc_count,
         repos=repos,
         last_indexed_at=state.get("last_indexed_at"),
+        checkpoints=checkpoints,
     )

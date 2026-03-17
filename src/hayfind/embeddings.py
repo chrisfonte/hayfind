@@ -29,14 +29,18 @@ logger = logging.getLogger(__name__)
 
 MODEL_NAME = os.getenv("HAYFIND_GEMINI_EMBED_MODEL", "gemini-embedding-001")
 OPENAI_MODEL_NAME = os.getenv("HAYFIND_OPENAI_EMBED_MODEL", "text-embedding-3-small")
-LOCAL_EMBED_URL = os.getenv(
-    "HAYFIND_LOCAL_EMBED_URL", "http://127.0.0.1:11434/api/embeddings"
-)
+LOCAL_EMBED_URL = os.getenv("HAYFIND_LOCAL_EMBED_URL", "http://127.0.0.1:11434/api/embeddings")
 LOCAL_MODEL_NAME = os.getenv("HAYFIND_LOCAL_EMBED_MODEL", "nomic-embed-text")
 
 # Gemini batch embeddings endpoint: max 100 items per request.
-DEFAULT_BATCH_SIZE = 50
-DEFAULT_SLEEP_S = 0.05
+DEFAULT_BATCH_SIZE = 20  # was 50 — safe for Gemini free tier (~2 API calls/sec at 0.5s sleep)
+DEFAULT_SLEEP_S = 0.5  # was 0.05 — keeps throughput within 60 req/min free-tier limit
+
+PROVIDER_BATCH_CAPS: dict[str, int] = {
+    "gemini": 100,
+    "openai": 2048,
+    "local": 512,
+}
 
 T = TypeVar("T")
 
@@ -131,32 +135,22 @@ class GeminiEmbedder:
 
         self._client = genai.Client(api_key=load_gemini_api_key())
 
-    def _extract_values(self, payload: Any) -> list[float]:
-        if isinstance(payload, dict) and "values" in payload:
-            return [float(v) for v in payload["values"]]
-        if hasattr(payload, "values"):
-            return [float(v) for v in payload.values]
-        if isinstance(payload, list):
-            return [float(v) for v in payload]
-        if isinstance(payload, tuple):
-            return [float(v) for v in payload]
-        if payload is None:
-            return []
-        if hasattr(payload, "__iter__") and not isinstance(payload, (str, bytes)):
-            return [float(v) for v in payload]
-        raise RuntimeError("Unexpected embedding vector format from Gemini API")
-
     def _extract_embeddings(self, payload: Any) -> list[list[float]]:
+        # The new SDK returns a response object with an 'embeddings' attribute
+        # which is a list of objects that have a 'values' attribute.
+        if hasattr(payload, "embeddings"):
+            return [[float(v) for v in item.values] for item in payload.embeddings]
+        if hasattr(payload, "embedding"):
+            return [[float(v) for v in payload.embedding.values]]
+
+        # Fallback for dict-like access if needed
         if isinstance(payload, dict):
             if "embeddings" in payload:
-                return [self._extract_values(item) for item in payload["embeddings"]]
+                return [[float(v) for v in item["values"]] for item in payload["embeddings"]]
             if "embedding" in payload:
-                return [self._extract_values(payload["embedding"])]
-        if hasattr(payload, "embeddings"):
-            return [self._extract_values(item) for item in payload.embeddings]
-        if hasattr(payload, "embedding"):
-            return [self._extract_values(payload.embedding)]
-        raise RuntimeError("Unexpected embedding response format from Gemini API")
+                return [[float(v) for v in payload["embedding"]["values"]]]
+
+        raise RuntimeError(f"Unexpected embedding response format from Gemini API: {type(payload)}")
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         """Embed a list of document chunks.
@@ -172,7 +166,10 @@ class GeminiEmbedder:
         if not texts:
             return []
 
-        batch_size = min(_env_int("HAYFIND_EMBED_BATCH_SIZE", DEFAULT_BATCH_SIZE), 100)
+        batch_size = min(
+            _env_int("HAYFIND_EMBED_BATCH_SIZE", DEFAULT_BATCH_SIZE),
+            PROVIDER_BATCH_CAPS["gemini"],
+        )
         sleep_s = _env_float("HAYFIND_EMBED_SLEEP_S", DEFAULT_SLEEP_S)
 
         all_vectors: list[list[float]] = []
@@ -306,6 +303,39 @@ class LocalEmbedder:
         return self._embed_one(query)
 
 
+class AdaptiveThrottle:
+    """Tracks 429 rate and auto-adjusts sleep interval.
+
+    Only activated when ``HAYFIND_ADAPTIVE_THROTTLE=1``.
+    Doubles sleep on repeated rate limits (cap 10s); halves on sustained success (floor base).
+    """
+
+    def __init__(self, base_sleep: float) -> None:
+        self._sleep = base_sleep
+        self._base = base_sleep
+        self._recent_limits: list[float] = []
+        self._success_count: int = 0
+
+    def record_rate_limit(self) -> None:
+        now = time.time()
+        self._recent_limits = [t for t in self._recent_limits if now - t < 60]
+        self._recent_limits.append(now)
+        self._success_count = 0
+        if len(self._recent_limits) >= 2:
+            self._sleep = min(self._sleep * 2, 10.0)
+            logger.warning("Adaptive throttle: backing off to %.1fs sleep", self._sleep)
+
+    def record_success(self) -> None:
+        self._success_count += 1
+        if self._success_count >= 20 and not self._recent_limits:
+            self._sleep = max(self._sleep / 2, self._base)
+            self._success_count = 0
+
+    def sleep(self) -> None:
+        if self._sleep:
+            time.sleep(self._sleep)
+
+
 class FallbackEmbedder:
     def __init__(
         self,
@@ -369,9 +399,7 @@ class FallbackEmbedder:
 def _normalize_provider(name: str | None) -> str:
     provider = (name or "gemini").strip().lower()
     if provider not in {"gemini", "openai", "local"}:
-        raise RuntimeError(
-            "Unsupported HAYFIND_EMBED_PROVIDER. Use one of: gemini, openai, local"
-        )
+        raise RuntimeError("Unsupported HAYFIND_EMBED_PROVIDER. Use one of: gemini, openai, local")
     return provider
 
 
@@ -400,9 +428,7 @@ def _build_provider(provider: str) -> Any:
 
 def get_embedder(*, for_indexing: bool = False) -> Any:
     provider = _normalize_provider(os.getenv("HAYFIND_EMBED_PROVIDER"))
-    fallback_provider = _normalize_fallback_provider(
-        os.getenv("HAYFIND_EMBED_FALLBACK_PROVIDER")
-    )
+    fallback_provider = _normalize_fallback_provider(os.getenv("HAYFIND_EMBED_FALLBACK_PROVIDER"))
 
     primary = _build_provider(provider)
     if not for_indexing or not fallback_provider or fallback_provider == provider:

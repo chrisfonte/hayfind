@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -80,5 +81,6 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
 
 
 def data_dir() -> Path:
-    DEFAULT_DATA_DIR.mkdir(parents=True, exist_ok=True)
-    return DEFAULT_DATA_DIR
+    path = Path(os.getenv("HAYFIND_DATA_DIR", str(DEFAULT_DATA_DIR))).expanduser()
+    path.mkdir(parents=True, exist_ok=True)
+    return path
